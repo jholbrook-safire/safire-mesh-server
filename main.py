@@ -37,6 +37,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+# Tweaker-3: Research-backed auto-orientation algorithm (used by Cura)
+try:
+    from MeshTweaker import Tweak
+    TWEAKER_AVAILABLE = True
+except ImportError:
+    TWEAKER_AVAILABLE = False
+    print("WARNING: Tweaker-3 not available, auto-orient will be limited")
+
 
 # ============================================================================
 # Configuration
@@ -171,22 +179,6 @@ def load_mesh(path: Path) -> trimesh.Trimesh:
     return mesh
 
 
-def compute_base_contact_area(mesh: trimesh.Trimesh, threshold: float = 0.1) -> float:
-    """
-    Compute the area of faces that would contact the build plate (Z near minimum).
-    """
-    z_min = mesh.bounds[0, 2]
-    contact_area = 0.0
-    
-    for i, face in enumerate(mesh.faces):
-        # Check if all vertices of this face are near the bottom
-        face_vertices = mesh.vertices[face]
-        if np.all(face_vertices[:, 2] < z_min + threshold):
-            contact_area += mesh.area_faces[i]
-    
-    return contact_area
-
-
 def lay_flat(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     """
     Simple lay-flat: just move the mesh so its lowest point is at Z=0.
@@ -197,65 +189,60 @@ def lay_flat(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     return result
 
 
-def find_optimal_orientation(mesh: trimesh.Trimesh, conservative: bool = True) -> trimesh.Trimesh:
+def auto_orient_mesh(mesh: trimesh.Trimesh, extended_mode: bool = True) -> trimesh.Trimesh:
     """
-    Find optimal print orientation. 
+    Find optimal print orientation using Tweaker-3 algorithm.
     
-    If conservative=True (default), only reorient if significantly better than current.
-    This prevents unnecessary rotation of models that are already well-oriented.
+    Tweaker-3 is a research-backed algorithm that:
+    - Minimizes support material needed
+    - Maximizes build plate contact area
+    - Uses evolutionarily-optimized parameters
+    - Is the same algorithm used by Cura's Auto-Orientation plugin
+    
+    Args:
+        mesh: The trimesh object to orient
+        extended_mode: Use extended analysis for more reliable results (slower)
+    
+    Returns:
+        Oriented mesh sitting on Z=0
     """
-    # First, lay the mesh flat in its current orientation
-    current = lay_flat(mesh)
-    current_contact = compute_base_contact_area(current)
-    current_score = current_contact
+    if not TWEAKER_AVAILABLE:
+        print("Tweaker-3 not available, using simple lay-flat")
+        return lay_flat(mesh)
     
-    # Get convex hull for stability analysis
-    hull = mesh.convex_hull
-    
-    best_score = current_score
-    best_mesh = current
-    
-    # Test each face of the convex hull as potential bottom
-    for i, normal in enumerate(hull.face_normals):
-        # Calculate rotation to align this face normal with -Z (pointing down)
-        target = np.array([0, 0, -1])
-        dot = np.dot(normal, target)
+    try:
+        # Convert trimesh to the format Tweaker expects (list of vertices)
+        # Tweaker needs faces as vertex coordinates, not indices
+        faces_as_vertices = mesh.vertices[mesh.faces].reshape(-1, 3)
         
-        # Skip faces that are already mostly horizontal
-        if abs(dot) > 0.95:
-            continue
-            
-        # Skip faces pointing mostly upward (would flip model upside down)
-        if dot > 0.3:  # Normal pointing somewhat upward
-            continue
+        # Run Tweaker-3 algorithm
+        tweak = Tweak(
+            content=faces_as_vertices,
+            extended_mode=extended_mode,
+            verbose=False,
+            min_volume=True  # Minimize support material volume
+        )
         
-        # Calculate rotation
-        axis = np.cross(normal, target)
-        axis_norm = np.linalg.norm(axis)
-        if axis_norm < 1e-6:
-            continue
-            
-        axis = axis / axis_norm
-        angle = np.arccos(np.clip(dot, -1, 1))
-        rotation = trimesh.transformations.rotation_matrix(angle, axis)
+        # Apply the rotation matrix from Tweaker
+        oriented = mesh.copy()
         
-        # Apply rotation and lay flat
-        candidate = mesh.copy()
-        candidate.apply_transform(rotation)
-        candidate = lay_flat(candidate)
+        # Tweaker returns a 3x3 rotation matrix
+        rotation_matrix_3x3 = np.array(tweak.matrix)
         
-        # Score: contact area (larger = more stable)
-        contact = compute_base_contact_area(candidate)
-        score = contact
+        # Convert to 4x4 for trimesh
+        rotation_matrix_4x4 = np.eye(4)
+        rotation_matrix_4x4[:3, :3] = rotation_matrix_3x3
         
-        # Only accept if significantly better (conservative mode)
-        improvement_threshold = 1.5 if conservative else 1.0
+        oriented.apply_transform(rotation_matrix_4x4)
         
-        if score > best_score * improvement_threshold:
-            best_score = score
-            best_mesh = candidate
-    
-    return best_mesh
+        # Move to sit on Z=0
+        oriented.vertices[:, 2] -= oriented.bounds[0, 2]
+        
+        return oriented
+        
+    except Exception as e:
+        print(f"Tweaker-3 failed: {e}, falling back to lay-flat")
+        return lay_flat(mesh)
 
 
 # ============================================================================
@@ -353,7 +340,7 @@ async def orient_mesh(file: UploadFile = File(...)):
         output_path = job_dir / "oriented.stl"
         
         mesh = load_mesh(input_path)
-        oriented = find_optimal_orientation(mesh)
+        oriented = auto_orient_mesh(mesh, extended_mode=True)
         oriented.export(str(output_path))
         
         return FileResponse(
@@ -374,18 +361,21 @@ async def orient_mesh(file: UploadFile = File(...)):
 async def prepare_mesh(
     file: UploadFile = File(...),
     target_size_mm: float = Form(default=0),
-    auto_orient: bool = Form(default=False),
+    auto_orient: bool = Form(default=True),
 ):
     """
-    Full mesh preparation using SuperSlicer CLI for repair + center.
+    Full mesh preparation: repair + auto-orient + center + optional scale.
+    
+    Uses Tweaker-3 algorithm (same as Cura's Auto-Orientation) to find
+    the optimal print orientation that minimizes support material.
     
     Args:
         file: STL/OBJ file to prepare
         target_size_mm: Scale to this max dimension (0 = no scaling)
-        auto_orient: If True, attempt to find optimal print orientation (experimental).
-                     If False (default), preserves original orientation.
+        auto_orient: If True (default), find optimal print orientation.
+                     If False, just lay flat preserving original orientation.
     
-    Returns prepared STL file.
+    Returns prepared STL file ready for slicing.
     """
     job_dir = create_job_dir()
     
@@ -436,12 +426,17 @@ async def prepare_mesh(
                 scale_factor = target_size_mm / current_max
                 mesh.apply_scale(scale_factor)
         
-        # Orient for printing (optional - default preserves original)
+        # Orient for printing using Tweaker-3 algorithm
         if auto_orient:
-            mesh = find_optimal_orientation(mesh, conservative=True)
+            mesh = auto_orient_mesh(mesh, extended_mode=True)
         else:
             # Just lay flat - move to Z=0 without rotating
             mesh = lay_flat(mesh)
+        
+        # Center on XY origin
+        centroid = mesh.centroid
+        mesh.vertices[:, 0] -= centroid[0]
+        mesh.vertices[:, 1] -= centroid[1]
         
         mesh.export(str(output_path))
         
