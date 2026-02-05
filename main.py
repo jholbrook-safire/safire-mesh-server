@@ -377,13 +377,13 @@ async def prepare_mesh(
     auto_orient: bool = Form(default=False),
 ):
     """
-    Full mesh preparation: repair + center + lay flat + optional scale.
+    Full mesh preparation using SuperSlicer CLI for repair + center.
     
     Args:
         file: STL/OBJ file to prepare
         target_size_mm: Scale to this max dimension (0 = no scaling)
-        auto_orient: If True, attempt to find optimal print orientation.
-                     If False (default), just lay flat preserving original orientation.
+        auto_orient: If True, attempt to find optimal print orientation (experimental).
+                     If False (default), preserves original orientation.
     
     Returns prepared STL file.
     """
@@ -393,16 +393,42 @@ async def prepare_mesh(
         input_path = await save_upload(file, job_dir)
         output_path = job_dir / "prepared.stl"
         
-        mesh = load_mesh(input_path)
+        # Use SuperSlicer for repair if available, fallback to trimesh
+        repaired_path = job_dir / "repaired.stl"
         
-        # 1. Repair
-        mesh.fill_holes()
-        mesh.fix_normals()
-        mesh.merge_vertices()
-        mesh.remove_unreferenced_vertices()
-        mesh.update_faces(mesh.nondegenerate_faces())
+        try:
+            # Try SuperSlicer repair (better quality)
+            cmd = [
+                SUPERSLICER_PATH,
+                "--repair",
+                "--export-stl",
+                "--center", "0,0",
+                "--output", str(repaired_path),
+                str(input_path),
+            ]
+            
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            )
+            
+            if repaired_path.exists():
+                mesh = load_mesh(repaired_path)
+            else:
+                # SuperSlicer failed, use trimesh
+                mesh = load_mesh(input_path)
+                mesh.fill_holes()
+                mesh.fix_normals()
+                mesh.merge_vertices()
+        except Exception:
+            # Fallback to trimesh repair
+            mesh = load_mesh(input_path)
+            mesh.fill_holes()
+            mesh.fix_normals()
+            mesh.merge_vertices()
         
-        # 2. Scale if requested
+        # Scale if requested
         if target_size_mm > 0:
             current_size = mesh.bounds[1] - mesh.bounds[0]
             current_max = max(current_size)
@@ -410,16 +436,12 @@ async def prepare_mesh(
                 scale_factor = target_size_mm / current_max
                 mesh.apply_scale(scale_factor)
         
-        # 3. Orient for printing (or just lay flat)
+        # Orient for printing (optional - default preserves original)
         if auto_orient:
             mesh = find_optimal_orientation(mesh, conservative=True)
         else:
+            # Just lay flat - move to Z=0 without rotating
             mesh = lay_flat(mesh)
-        
-        # 4. Center on origin (XY)
-        centroid = mesh.centroid
-        mesh.vertices[:, 0] -= centroid[0]
-        mesh.vertices[:, 1] -= centroid[1]
         
         mesh.export(str(output_path))
         
