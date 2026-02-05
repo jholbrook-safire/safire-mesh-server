@@ -171,57 +171,91 @@ def load_mesh(path: Path) -> trimesh.Trimesh:
     return mesh
 
 
-def find_optimal_orientation(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+def compute_base_contact_area(mesh: trimesh.Trimesh, threshold: float = 0.1) -> float:
     """
-    Find optimal print orientation by maximizing flat surface area on build plate.
-    Uses convex hull and analyzes face normals.
+    Compute the area of faces that would contact the build plate (Z near minimum).
     """
+    z_min = mesh.bounds[0, 2]
+    contact_area = 0.0
+    
+    for i, face in enumerate(mesh.faces):
+        # Check if all vertices of this face are near the bottom
+        face_vertices = mesh.vertices[face]
+        if np.all(face_vertices[:, 2] < z_min + threshold):
+            contact_area += mesh.area_faces[i]
+    
+    return contact_area
+
+
+def lay_flat(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """
+    Simple lay-flat: just move the mesh so its lowest point is at Z=0.
+    Preserves original orientation.
+    """
+    result = mesh.copy()
+    result.vertices[:, 2] -= result.bounds[0, 2]
+    return result
+
+
+def find_optimal_orientation(mesh: trimesh.Trimesh, conservative: bool = True) -> trimesh.Trimesh:
+    """
+    Find optimal print orientation. 
+    
+    If conservative=True (default), only reorient if significantly better than current.
+    This prevents unnecessary rotation of models that are already well-oriented.
+    """
+    # First, lay the mesh flat in its current orientation
+    current = lay_flat(mesh)
+    current_contact = compute_base_contact_area(current)
+    current_score = current_contact
+    
     # Get convex hull for stability analysis
     hull = mesh.convex_hull
     
-    # Find faces that could be the "bottom" (facing -Z)
-    best_score = -1
-    best_transform = np.eye(4)
+    best_score = current_score
+    best_mesh = current
     
     # Test each face of the convex hull as potential bottom
     for i, normal in enumerate(hull.face_normals):
-        # Calculate rotation to align this face normal with -Z
+        # Calculate rotation to align this face normal with -Z (pointing down)
         target = np.array([0, 0, -1])
-        
-        # Skip if already aligned
         dot = np.dot(normal, target)
-        if abs(dot) > 0.999:
-            rotation = np.eye(4)
-        else:
-            # Rodrigues rotation formula
-            axis = np.cross(normal, target)
-            axis_norm = np.linalg.norm(axis)
-            if axis_norm > 1e-6:
-                axis = axis / axis_norm
-                angle = np.arccos(np.clip(dot, -1, 1))
-                rotation = trimesh.transformations.rotation_matrix(angle, axis)
-            else:
-                rotation = np.eye(4)
         
-        # Score based on face area (larger flat bottom = better)
-        face_area = hull.area_faces[i]
+        # Skip faces that are already mostly horizontal
+        if abs(dot) > 0.95:
+            continue
+            
+        # Skip faces pointing mostly upward (would flip model upside down)
+        if dot > 0.3:  # Normal pointing somewhat upward
+            continue
         
-        # Bonus for faces closer to horizontal
-        flatness = abs(dot)
-        score = face_area * flatness
+        # Calculate rotation
+        axis = np.cross(normal, target)
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm < 1e-6:
+            continue
+            
+        axis = axis / axis_norm
+        angle = np.arccos(np.clip(dot, -1, 1))
+        rotation = trimesh.transformations.rotation_matrix(angle, axis)
         
-        if score > best_score:
+        # Apply rotation and lay flat
+        candidate = mesh.copy()
+        candidate.apply_transform(rotation)
+        candidate = lay_flat(candidate)
+        
+        # Score: contact area (larger = more stable)
+        contact = compute_base_contact_area(candidate)
+        score = contact
+        
+        # Only accept if significantly better (conservative mode)
+        improvement_threshold = 1.5 if conservative else 1.0
+        
+        if score > best_score * improvement_threshold:
             best_score = score
-            best_transform = rotation
+            best_mesh = candidate
     
-    # Apply the best rotation
-    oriented = mesh.copy()
-    oriented.apply_transform(best_transform)
-    
-    # Move to sit on Z=0 plane
-    oriented.vertices[:, 2] -= oriented.bounds[0, 2]
-    
-    return oriented
+    return best_mesh
 
 
 # ============================================================================
@@ -340,9 +374,17 @@ async def orient_mesh(file: UploadFile = File(...)):
 async def prepare_mesh(
     file: UploadFile = File(...),
     target_size_mm: float = Form(default=0),
+    auto_orient: bool = Form(default=False),
 ):
     """
-    Full mesh preparation: repair + center + orient + optional scale.
+    Full mesh preparation: repair + center + lay flat + optional scale.
+    
+    Args:
+        file: STL/OBJ file to prepare
+        target_size_mm: Scale to this max dimension (0 = no scaling)
+        auto_orient: If True, attempt to find optimal print orientation.
+                     If False (default), just lay flat preserving original orientation.
+    
     Returns prepared STL file.
     """
     job_dir = create_job_dir()
@@ -368,8 +410,11 @@ async def prepare_mesh(
                 scale_factor = target_size_mm / current_max
                 mesh.apply_scale(scale_factor)
         
-        # 3. Orient for printing
-        mesh = find_optimal_orientation(mesh)
+        # 3. Orient for printing (or just lay flat)
+        if auto_orient:
+            mesh = find_optimal_orientation(mesh, conservative=True)
+        else:
+            mesh = lay_flat(mesh)
         
         # 4. Center on origin (XY)
         centroid = mesh.centroid
