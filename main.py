@@ -1,26 +1,32 @@
 """
 Safire Mesh Processing Server
 
-FastAPI server providing mesh repair, orientation, and slicing via PrusaSlicer CLI.
+FastAPI server providing mesh repair, orientation, and slicing.
+Uses trimesh for mesh operations and CuraEngine for slicing.
 Designed to run as a Docker container on Railway, Render, or similar platforms.
 
 Endpoints:
   POST /repair     - Repair mesh issues, return fixed STL
-  POST /orient     - Auto-orient for printing, return oriented STL
-  POST /prepare    - Full preparation (repair + center + orient)
+  POST /orient     - Auto-orient for printing, return oriented STL  
+  POST /prepare    - Full preparation (repair + center + orient + scale)
   POST /slice      - Slice to GCode with print settings
   POST /analyze    - Analyze mesh and return statistics
+  POST /simplify   - Simplify mesh to reduce polygon count
   GET  /health     - Health check
 
-Created: 2026-02-04
+Created At (ISO): 2026-02-04T00:00:00Z
+Created At (PT): 2026-02-03T16:00:00 PST
+Updated At (ISO): 2026-02-05T14:00:00Z
+Updated At (PT): 2026-02-05T06:00:00 PST
+Updated By: AI
 """
 
 import os
 import uuid
 import asyncio
 import subprocess
-import tempfile
 import shutil
+import numpy as np
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -28,7 +34,7 @@ from contextlib import asynccontextmanager
 import trimesh
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 
@@ -36,7 +42,7 @@ from pydantic import BaseModel
 # Configuration
 # ============================================================================
 
-PRUSA_SLICER_PATH = os.getenv("PRUSA_SLICER_PATH", "prusa-slicer")
+CURA_ENGINE_PATH = os.getenv("CURA_ENGINE_PATH", "CuraEngine")
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "/tmp/safire-mesh"))
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 
@@ -50,19 +56,20 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: verify PrusaSlicer is available
+    # Startup: verify CuraEngine is available
     try:
         result = subprocess.run(
-            [PRUSA_SLICER_PATH, "--version"],
+            [CURA_ENGINE_PATH, "--version"],
             capture_output=True,
             text=True,
             timeout=10
         )
-        print(f"PrusaSlicer version: {result.stdout.strip()}")
+        print(f"CuraEngine: {result.stdout.strip() or result.stderr.strip()}")
     except FileNotFoundError:
-        print("WARNING: PrusaSlicer not found at", PRUSA_SLICER_PATH)
+        print("WARNING: CuraEngine not found at", CURA_ENGINE_PATH)
+        print("Slicing endpoint will not be available")
     except Exception as e:
-        print(f"WARNING: Could not check PrusaSlicer: {e}")
+        print(f"WARNING: Could not check CuraEngine: {e}")
     
     yield
     
@@ -81,7 +88,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Safire Mesh Server",
-    description="Mesh processing API with PrusaSlicer and trimesh",
+    description="Mesh processing API with trimesh and CuraEngine",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -111,13 +118,6 @@ class MeshStats(BaseModel):
     center_of_mass: Optional[list] = None
 
 
-class SliceSettings(BaseModel):
-    layer_height: float = 0.2
-    infill_percent: int = 20
-    support_material: bool = False
-    # Add more as needed
-
-
 # ============================================================================
 # Utilities
 # ============================================================================
@@ -132,40 +132,18 @@ def create_job_dir() -> Path:
 
 async def save_upload(file: UploadFile, job_dir: Path) -> Path:
     """Save uploaded file to job directory."""
-    # Validate file size
     content = await file.read()
     if len(content) > MAX_FILE_SIZE_MB * 1024 * 1024:
         raise HTTPException(400, f"File too large. Max size: {MAX_FILE_SIZE_MB}MB")
     
-    # Save to temp file
-    input_path = job_dir / "input.stl"
+    # Determine file extension from filename
+    ext = Path(file.filename or "model.stl").suffix.lower() or ".stl"
+    input_path = job_dir / f"input{ext}"
+    
     with open(input_path, "wb") as f:
         f.write(content)
     
     return input_path
-
-
-async def run_prusa_slicer(args: list, timeout: int = 120) -> subprocess.CompletedProcess:
-    """Run PrusaSlicer CLI with given arguments."""
-    cmd = [PRUSA_SLICER_PATH] + args
-    
-    try:
-        # Run in thread pool to not block
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-        )
-        return result
-    except subprocess.TimeoutExpired:
-        raise HTTPException(504, "Processing timed out")
-    except Exception as e:
-        raise HTTPException(500, f"PrusaSlicer error: {str(e)}")
 
 
 def cleanup_job(job_dir: Path):
@@ -174,6 +152,76 @@ def cleanup_job(job_dir: Path):
         shutil.rmtree(job_dir, ignore_errors=True)
     except:
         pass
+
+
+def load_mesh(path: Path) -> trimesh.Trimesh:
+    """Load a mesh file and ensure it's a Trimesh."""
+    mesh = trimesh.load(str(path))
+    
+    # Handle scene (multiple meshes) by concatenating
+    if isinstance(mesh, trimesh.Scene):
+        meshes = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not meshes:
+            raise HTTPException(400, "No valid geometry found in file")
+        mesh = trimesh.util.concatenate(meshes)
+    
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise HTTPException(400, "Could not load as triangle mesh")
+    
+    return mesh
+
+
+def find_optimal_orientation(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """
+    Find optimal print orientation by maximizing flat surface area on build plate.
+    Uses convex hull and analyzes face normals.
+    """
+    # Get convex hull for stability analysis
+    hull = mesh.convex_hull
+    
+    # Find faces that could be the "bottom" (facing -Z)
+    best_score = -1
+    best_transform = np.eye(4)
+    
+    # Test each face of the convex hull as potential bottom
+    for i, normal in enumerate(hull.face_normals):
+        # Calculate rotation to align this face normal with -Z
+        target = np.array([0, 0, -1])
+        
+        # Skip if already aligned
+        dot = np.dot(normal, target)
+        if abs(dot) > 0.999:
+            rotation = np.eye(4)
+        else:
+            # Rodrigues rotation formula
+            axis = np.cross(normal, target)
+            axis_norm = np.linalg.norm(axis)
+            if axis_norm > 1e-6:
+                axis = axis / axis_norm
+                angle = np.arccos(np.clip(dot, -1, 1))
+                rotation = trimesh.transformations.rotation_matrix(angle, axis)
+            else:
+                rotation = np.eye(4)
+        
+        # Score based on face area (larger flat bottom = better)
+        face_area = hull.area_faces[i]
+        
+        # Bonus for faces closer to horizontal
+        flatness = abs(dot)
+        score = face_area * flatness
+        
+        if score > best_score:
+            best_score = score
+            best_transform = rotation
+    
+    # Apply the best rotation
+    oriented = mesh.copy()
+    oriented.apply_transform(best_transform)
+    
+    # Move to sit on Z=0 plane
+    oriented.vertices[:, 2] -= oriented.bounds[0, 2]
+    
+    return oriented
 
 
 # ============================================================================
@@ -190,20 +238,13 @@ async def health_check():
 async def analyze_mesh(file: UploadFile = File(...)):
     """
     Analyze mesh and return statistics.
-    Uses trimesh for detailed analysis.
     """
     job_dir = create_job_dir()
     
     try:
         input_path = await save_upload(file, job_dir)
+        mesh = load_mesh(input_path)
         
-        # Load with trimesh for analysis
-        mesh = trimesh.load(str(input_path))
-        
-        if not isinstance(mesh, trimesh.Trimesh):
-            raise HTTPException(400, "Could not load as triangle mesh")
-        
-        # Compute stats
         bounds = mesh.bounds
         stats = MeshStats(
             vertices=len(mesh.vertices),
@@ -229,7 +270,7 @@ async def analyze_mesh(file: UploadFile = File(...)):
 @app.post("/repair")
 async def repair_mesh(file: UploadFile = File(...)):
     """
-    Repair mesh issues using PrusaSlicer.
+    Repair mesh issues (holes, normals, duplicates).
     Returns repaired STL file.
     """
     job_dir = create_job_dir()
@@ -238,30 +279,24 @@ async def repair_mesh(file: UploadFile = File(...)):
         input_path = await save_upload(file, job_dir)
         output_path = job_dir / "repaired.stl"
         
-        # Run PrusaSlicer repair
-        result = await run_prusa_slicer([
-            "--repair",
-            "--export-stl", str(output_path),
-            str(input_path)
-        ])
+        mesh = load_mesh(input_path)
         
-        if not output_path.exists():
-            # If PrusaSlicer didn't create output, try trimesh as fallback
-            mesh = trimesh.load(str(input_path))
-            if isinstance(mesh, trimesh.Trimesh):
-                # Basic repair: fill holes, fix normals
-                mesh.fill_holes()
-                mesh.fix_normals()
-                mesh.export(str(output_path))
+        # Repair operations
+        mesh.fill_holes()
+        mesh.fix_normals()
+        mesh.remove_duplicate_faces()
+        mesh.remove_degenerate_faces()
+        mesh.remove_unreferenced_vertices()
         
-        if not output_path.exists():
-            raise HTTPException(500, "Repair failed to produce output")
+        # Merge close vertices
+        mesh.merge_vertices()
+        
+        mesh.export(str(output_path))
         
         return FileResponse(
             output_path,
             media_type="model/stl",
             filename="repaired.stl",
-            background=None  # Don't cleanup immediately
         )
         
     except HTTPException:
@@ -275,7 +310,7 @@ async def repair_mesh(file: UploadFile = File(...)):
 @app.post("/orient")
 async def orient_mesh(file: UploadFile = File(...)):
     """
-    Auto-orient mesh for optimal printing (minimize supports).
+    Auto-orient mesh for optimal printing (maximize flat bottom).
     Returns oriented STL file.
     """
     job_dir = create_job_dir()
@@ -284,16 +319,9 @@ async def orient_mesh(file: UploadFile = File(...)):
         input_path = await save_upload(file, job_dir)
         output_path = job_dir / "oriented.stl"
         
-        # Run PrusaSlicer orient
-        result = await run_prusa_slicer([
-            "--orient",
-            "--center",
-            "--export-stl", str(output_path),
-            str(input_path)
-        ])
-        
-        if not output_path.exists():
-            raise HTTPException(500, "Orient failed to produce output")
+        mesh = load_mesh(input_path)
+        oriented = find_optimal_orientation(mesh)
+        oriented.export(str(output_path))
         
         return FileResponse(
             output_path,
@@ -315,8 +343,7 @@ async def prepare_mesh(
     target_size_mm: float = Form(default=0),
 ):
     """
-    Full mesh preparation: repair + center + orient.
-    Optionally scale to target size.
+    Full mesh preparation: repair + center + orient + optional scale.
     Returns prepared STL file.
     """
     job_dir = create_job_dir()
@@ -325,32 +352,32 @@ async def prepare_mesh(
         input_path = await save_upload(file, job_dir)
         output_path = job_dir / "prepared.stl"
         
-        # Build PrusaSlicer command
-        args = [
-            "--repair",
-            "--center",
-            "--orient",
-        ]
+        mesh = load_mesh(input_path)
         
-        # Add scaling if requested
+        # 1. Repair
+        mesh.fill_holes()
+        mesh.fix_normals()
+        mesh.remove_duplicate_faces()
+        mesh.remove_degenerate_faces()
+        mesh.merge_vertices()
+        
+        # 2. Scale if requested
         if target_size_mm > 0:
-            # First, load to get current size
-            mesh = trimesh.load(str(input_path))
-            if isinstance(mesh, trimesh.Trimesh):
-                current_max = max(mesh.bounds[1] - mesh.bounds[0])
-                if current_max > 0:
-                    scale_factor = target_size_mm / current_max
-                    args.extend(["--scale", str(scale_factor)])
+            current_size = mesh.bounds[1] - mesh.bounds[0]
+            current_max = max(current_size)
+            if current_max > 0:
+                scale_factor = target_size_mm / current_max
+                mesh.apply_scale(scale_factor)
         
-        args.extend([
-            "--export-stl", str(output_path),
-            str(input_path)
-        ])
+        # 3. Orient for printing
+        mesh = find_optimal_orientation(mesh)
         
-        result = await run_prusa_slicer(args)
+        # 4. Center on origin (XY)
+        centroid = mesh.centroid
+        mesh.vertices[:, 0] -= centroid[0]
+        mesh.vertices[:, 1] -= centroid[1]
         
-        if not output_path.exists():
-            raise HTTPException(500, "Preparation failed to produce output")
+        mesh.export(str(output_path))
         
         return FileResponse(
             output_path,
@@ -371,12 +398,12 @@ async def slice_mesh(
     file: UploadFile = File(...),
     layer_height: float = Form(default=0.2),
     infill_percent: int = Form(default=20),
-    support_material: bool = Form(default=False),
-    printer_profile: str = Form(default=""),
 ):
     """
-    Slice mesh to GCode using PrusaSlicer.
+    Slice mesh to GCode using CuraEngine.
     Returns GCode file.
+    
+    Note: Requires CuraEngine to be installed.
     """
     job_dir = create_job_dir()
     
@@ -384,33 +411,46 @@ async def slice_mesh(
         input_path = await save_upload(file, job_dir)
         output_path = job_dir / "output.gcode"
         
-        # Build command
-        args = [
-            "--repair",
-            "--center",
-            "--orient",
-            f"--layer-height={layer_height}",
-            f"--fill-density={infill_percent}%",
+        # First prepare the mesh
+        mesh = load_mesh(input_path)
+        mesh.fill_holes()
+        mesh.fix_normals()
+        prepared_path = job_dir / "prepared.stl"
+        mesh.export(str(prepared_path))
+        
+        # Run CuraEngine
+        # Note: CuraEngine requires a definition file for settings
+        # This is a simplified example - production would need proper config
+        cmd = [
+            CURA_ENGINE_PATH,
+            "slice",
+            "-j", "/usr/share/cura/resources/definitions/fdmprinter.def.json",
+            "-o", str(output_path),
+            "-s", f"layer_height={layer_height}",
+            "-s", f"infill_sparse_density={infill_percent}",
+            "-l", str(prepared_path),
         ]
         
-        if support_material:
-            args.append("--support-material")
-        
-        if printer_profile:
-            args.extend(["--load", printer_profile])
-        
-        args.extend([
-            "--export-gcode",
-            "-o", str(output_path),
-            str(input_path)
-        ])
-        
-        result = await run_prusa_slicer(args, timeout=300)  # Slicing can take longer
-        
-        if not output_path.exists():
-            # Check for errors
-            error_msg = result.stderr if result else "Unknown error"
-            raise HTTPException(500, f"Slicing failed: {error_msg}")
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+            )
+            
+            if not output_path.exists():
+                error_msg = result.stderr or result.stdout or "Unknown error"
+                raise HTTPException(500, f"Slicing failed: {error_msg}")
+                
+        except FileNotFoundError:
+            raise HTTPException(503, "CuraEngine not available on this server")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(504, "Slicing timed out")
         
         return FileResponse(
             output_path,
@@ -433,7 +473,6 @@ async def simplify_mesh(
 ):
     """
     Simplify mesh to reduce polygon count.
-    Uses trimesh decimation.
     """
     job_dir = create_job_dir()
     
@@ -441,18 +480,12 @@ async def simplify_mesh(
         input_path = await save_upload(file, job_dir)
         output_path = job_dir / "simplified.stl"
         
-        # Load and simplify with trimesh
-        mesh = trimesh.load(str(input_path))
+        mesh = load_mesh(input_path)
         
-        if not isinstance(mesh, trimesh.Trimesh):
-            raise HTTPException(400, "Could not load as triangle mesh")
-        
-        # Simplify
         if len(mesh.faces) > target_faces:
             simplified = mesh.simplify_quadric_decimation(target_faces)
             simplified.export(str(output_path))
         else:
-            # Already simple enough
             mesh.export(str(output_path))
         
         return FileResponse(

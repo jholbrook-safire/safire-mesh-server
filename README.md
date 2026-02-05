@@ -1,6 +1,6 @@
 # Safire Mesh Server
 
-Mesh processing API server using PrusaSlicer CLI and trimesh. Provides repair, orientation, and slicing capabilities for 3D printing workflows.
+Mesh processing API server using trimesh for mesh operations and CuraEngine for slicing. Provides repair, orientation, and slicing capabilities for 3D printing workflows.
 
 ## Features
 
