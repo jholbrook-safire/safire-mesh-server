@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     wget \
     unzip \
+    git \
     libgl1-mesa-glx \
     libglu1-mesa \
     libgtk-3-0 \
