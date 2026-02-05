@@ -4,12 +4,9 @@
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.6
+charset-normalizer>=3.0.0
 
 # Mesh processing
 trimesh>=4.11.0
 numpy>=1.26.0
 scipy>=1.11.0
-networkx>=3.0
-
-# Auto-orientation (used by Cura's Auto-Orientation plugin)
-tweaker3 @ git+https://github.com/ChristophSchranz/Tweaker-3.git
