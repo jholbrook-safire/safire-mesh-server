@@ -26,14 +26,14 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install SuperSlicer
+# Install SuperSlicer (using AppImage)
 WORKDIR /opt
-RUN wget -q https://github.com/supermerill/SuperSlicer/releases/download/2.5.59.13/SuperSlicer_2.5.59.13_linux64_240701.tar.zip -O superslicer.tar.zip \
-    && unzip superslicer.tar.zip \
-    && tar -xf SuperSlicer_2.5.59.13_linux64_240701.tar \
-    && rm superslicer.tar.zip SuperSlicer_2.5.59.13_linux64_240701.tar \
-    && mv SuperSlicer /opt/superslicer \
-    && ln -s /opt/superslicer/superslicer /usr/local/bin/superslicer
+RUN wget -q https://github.com/supermerill/SuperSlicer/releases/download/2.5.59.13/SuperSlicer-ubuntu_20.04-2.5.59.13.AppImage -O superslicer.AppImage \
+    && chmod +x superslicer.AppImage \
+    && ./superslicer.AppImage --appimage-extract \
+    && rm superslicer.AppImage \
+    && mv squashfs-root /opt/superslicer \
+    && ln -s /opt/superslicer/AppRun /usr/local/bin/superslicer
 
 # Verify SuperSlicer installation
 RUN superslicer --help | head -5 || echo "SuperSlicer CLI ready"
