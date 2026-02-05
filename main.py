@@ -39,11 +39,12 @@ from pydantic import BaseModel
 
 # Tweaker-3: Research-backed auto-orientation algorithm (used by Cura)
 try:
-    from MeshTweaker import Tweak
+    from tweaker3.MeshTweaker import Tweak
     TWEAKER_AVAILABLE = True
-except ImportError:
+    print("Tweaker-3 loaded successfully")
+except ImportError as e:
     TWEAKER_AVAILABLE = False
-    print("WARNING: Tweaker-3 not available, auto-orient will be limited")
+    print(f"WARNING: Tweaker-3 not available ({e}), auto-orient will be limited")
 
 
 # ============================================================================
@@ -215,11 +216,14 @@ def auto_orient_mesh(mesh: trimesh.Trimesh, extended_mode: bool = True) -> trime
         # Tweaker needs faces as vertex coordinates, not indices
         faces_as_vertices = mesh.vertices[mesh.faces].reshape(-1, 3)
         
+        print(f"Running Tweaker-3 on mesh with {len(mesh.faces)} faces...")
+        print(f"Original bounds: {mesh.bounds.tolist()}")
+        
         # Run Tweaker-3 algorithm
         tweak = Tweak(
             content=faces_as_vertices,
             extended_mode=extended_mode,
-            verbose=False,
+            verbose=True,  # Enable verbose to see what it's doing
             min_volume=True  # Minimize support material volume
         )
         
@@ -228,6 +232,11 @@ def auto_orient_mesh(mesh: trimesh.Trimesh, extended_mode: bool = True) -> trime
         
         # Tweaker returns a 3x3 rotation matrix
         rotation_matrix_3x3 = np.array(tweak.matrix)
+        
+        # Check if it's close to identity (no rotation)
+        is_identity = np.allclose(rotation_matrix_3x3, np.eye(3), atol=0.01)
+        print(f"Tweaker rotation matrix:\n{rotation_matrix_3x3}")
+        print(f"Is identity (no rotation): {is_identity}")
         
         # Convert to 4x4 for trimesh
         rotation_matrix_4x4 = np.eye(4)
@@ -238,10 +247,14 @@ def auto_orient_mesh(mesh: trimesh.Trimesh, extended_mode: bool = True) -> trime
         # Move to sit on Z=0
         oriented.vertices[:, 2] -= oriented.bounds[0, 2]
         
+        print(f"Final bounds: {oriented.bounds.tolist()}")
+        
         return oriented
         
     except Exception as e:
         print(f"Tweaker-3 failed: {e}, falling back to lay-flat")
+        import traceback
+        traceback.print_exc()
         return lay_flat(mesh)
 
 
@@ -252,7 +265,11 @@ def auto_orient_mesh(mesh: trimesh.Trimesh, extended_mode: bool = True) -> trime
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "service": "safire-mesh-server"}
+    return {
+        "status": "healthy",
+        "service": "safire-mesh-server",
+        "tweaker_available": TWEAKER_AVAILABLE
+    }
 
 
 @app.post("/analyze")

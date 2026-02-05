@@ -9,6 +9,7 @@ python-multipart>=0.0.6
 trimesh>=4.11.0
 numpy>=1.26.0
 scipy>=1.11.0
+networkx>=3.0
 
 # Auto-orientation (used by Cura's Auto-Orientation plugin)
 tweaker3 @ git+https://github.com/ChristophSchranz/Tweaker-3.git
