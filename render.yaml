@@ -1,0 +1,14 @@
+# Render Blueprint specification
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: safire-mesh-server
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: MAX_FILE_SIZE_MB
+        value: 50
