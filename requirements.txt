@@ -11,4 +11,4 @@ numpy>=1.26.0
 scipy>=1.11.0
 
 # Auto-orientation (used by Cura's Auto-Orientation plugin)
-Tweaker-3 @ git+https://github.com/ChristophSchranz/Tweaker-3.git
+tweaker3 @ git+https://github.com/ChristophSchranz/Tweaker-3.git
