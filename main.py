@@ -16,8 +16,8 @@ Endpoints:
 
 Created At (ISO): 2026-02-04T00:00:00Z
 Created At (PT): 2026-02-03T16:00:00 PST
-Updated At (ISO): 2026-02-05T14:00:00Z
-Updated At (PT): 2026-02-05T06:00:00 PST
+Updated At (ISO): 2026-02-05T15:45:00Z
+Updated At (PT): 2026-02-05T07:45:00 PST
 Updated By: AI
 """
 
@@ -37,14 +37,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-# Tweaker-3: Research-backed auto-orientation algorithm (used by Cura)
-try:
-    from tweaker3.MeshTweaker import Tweak
-    TWEAKER_AVAILABLE = True
-    print("Tweaker-3 loaded successfully")
-except ImportError as e:
-    TWEAKER_AVAILABLE = False
-    print(f"WARNING: Tweaker-3 not available ({e}), auto-orient will be limited")
 
 
 # ============================================================================
@@ -190,72 +182,143 @@ def lay_flat(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     return result
 
 
-def auto_orient_mesh(mesh: trimesh.Trimesh, extended_mode: bool = True) -> trimesh.Trimesh:
+def auto_orient_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     """
-    Find optimal print orientation using Tweaker-3 algorithm.
+    Orient mesh for optimal 3D printing using PrusaSlicer's algorithm.
     
-    Tweaker-3 is a research-backed algorithm that:
-    - Minimizes support material needed
-    - Maximizes build plate contact area
-    - Uses evolutionarily-optimized parameters
-    - Is the same algorithm used by Cura's Auto-Orientation plugin
-    
-    Args:
-        mesh: The trimesh object to orient
-        extended_mode: Use extended analysis for more reliable results (slower)
+    Port of PrusaSlicer's Rotfinder.cpp algorithm:
+    - Tests each convex hull face as a potential base
+    - Rewards floor contact (negative score)
+    - Penalizes overhangs (positive score, angle³ weighting)
+    - Picks orientation with minimum total score
     
     Returns:
-        Oriented mesh sitting on Z=0
+        Oriented mesh sitting on Z=0, optimized for printing
     """
-    if not TWEAKER_AVAILABLE:
-        print("Tweaker-3 not available, using simple lay-flat")
-        return lay_flat(mesh)
-    
     try:
-        # Convert trimesh to the format Tweaker expects (list of vertices)
-        # Tweaker needs faces as vertex coordinates, not indices
-        faces_as_vertices = mesh.vertices[mesh.faces].reshape(-1, 3)
+        print(f"Auto-orienting mesh with {len(mesh.faces)} faces (PrusaSlicer algorithm)...")
         
-        print(f"Running Tweaker-3 on mesh with {len(mesh.faces)} faces...")
-        print(f"Original bounds: {mesh.bounds.tolist()}")
+        # Get convex hull - each face is a candidate base orientation
+        hull = mesh.convex_hull
         
-        # Run Tweaker-3 algorithm
-        tweak = Tweak(
-            content=faces_as_vertices,
-            extended_mode=extended_mode,
-            verbose=True,  # Enable verbose to see what it's doing
-            min_volume=True  # Minimize support material volume
-        )
+        # Collect unique rotations from hull faces
+        DOWN = np.array([0, 0, -1])
+        candidates = []
         
-        # Apply the rotation matrix from Tweaker
-        oriented = mesh.copy()
+        for i, normal in enumerate(hull.face_normals):
+            area = hull.area_faces[i]
+            
+            # Skip tiny faces
+            if area < 1e-6:
+                continue
+            
+            # Calculate rotation to put this face down
+            dot = np.dot(normal, DOWN)
+            
+            if dot > 0.999:
+                # Already pointing down
+                rotation = np.eye(4)
+            elif dot < -0.999:
+                # Pointing up - rotate 180 around X
+                rotation = trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0])
+            else:
+                axis = np.cross(normal, DOWN)
+                axis = axis / np.linalg.norm(axis)
+                angle = np.arccos(np.clip(dot, -1, 1))
+                rotation = trimesh.transformations.rotation_matrix(angle, axis)
+            
+            candidates.append((rotation, area))
         
-        # Tweaker returns a 3x3 rotation matrix
-        rotation_matrix_3x3 = np.array(tweak.matrix)
+        # Remove near-duplicate rotations, keep ones with larger face areas
+        unique_candidates = []
+        for rot, area in sorted(candidates, key=lambda x: -x[1]):  # Sort by area desc
+            is_duplicate = False
+            for existing_rot, _ in unique_candidates:
+                if np.allclose(rot, existing_rot, atol=0.1):
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                unique_candidates.append((rot, area))
         
-        # Check if it's close to identity (no rotation)
-        is_identity = np.allclose(rotation_matrix_3x3, np.eye(3), atol=0.01)
-        print(f"Tweaker rotation matrix:\n{rotation_matrix_3x3}")
-        print(f"Is identity (no rotation): {is_identity}")
+        print(f"Testing {len(unique_candidates)} candidate orientations...")
         
-        # Convert to 4x4 for trimesh
-        rotation_matrix_4x4 = np.eye(4)
-        rotation_matrix_4x4[:3, :3] = rotation_matrix_3x3
+        # Score each candidate orientation
+        best_score = float('inf')
+        best_rotation = np.eye(4)
         
-        oriented.apply_transform(rotation_matrix_4x4)
+        for rotation, _ in unique_candidates:
+            score = _score_orientation(mesh, rotation)
+            if score < best_score:
+                best_score = score
+                best_rotation = rotation
         
-        # Move to sit on Z=0
-        oriented.vertices[:, 2] -= oriented.bounds[0, 2]
+        print(f"Best orientation score: {best_score:.2f}")
         
-        print(f"Final bounds: {oriented.bounds.tolist()}")
+        # Apply best rotation
+        result = mesh.copy()
+        result.apply_transform(best_rotation)
         
-        return oriented
+        # Move to Z=0
+        result.vertices[:, 2] -= result.bounds[0, 2]
+        
+        print(f"Final bounds: {result.bounds.tolist()}")
+        return result
         
     except Exception as e:
-        print(f"Tweaker-3 failed: {e}, falling back to lay-flat")
+        print(f"Auto-orient failed: {e}, using lay-flat")
         import traceback
         traceback.print_exc()
         return lay_flat(mesh)
+
+
+def _score_orientation(mesh: trimesh.Trimesh, rotation: np.ndarray) -> float:
+    """
+    Score an orientation using PrusaSlicer's algorithm (vectorized for speed).
+    
+    Lower score = better orientation.
+    - Floor contact: -2 * area (reward)
+    - Overhangs: sqrt(area) * angle³ (penalty)
+    """
+    # Get rotation matrix (3x3) from 4x4 transform
+    rot_matrix = rotation[:3, :3]
+    
+    # Rotate normals (vectorized)
+    rotated_normals = mesh.face_normals @ rot_matrix.T
+    
+    # Rotate vertices to find Z positions
+    rotated_verts = mesh.vertices @ rot_matrix.T
+    z_min = rotated_verts[:, 2].min()
+    rotated_verts[:, 2] -= z_min
+    
+    # Get Z coordinates of each face's vertices
+    face_z = rotated_verts[mesh.faces, 2]  # Shape: (n_faces, 3)
+    max_face_z = face_z.max(axis=1)  # Highest vertex Z for each face
+    
+    # Floor threshold
+    z_height = rotated_verts[:, 2].max()
+    z_floor = max(0.1 * z_height, 0.5)
+    
+    # Identify floor faces (all vertices near Z=0)
+    on_floor = max_face_z <= z_floor
+    
+    # Get face areas
+    areas = mesh.area_faces
+    
+    # Floor contact score: -2 * area (reward)
+    floor_score = -2.0 * areas[on_floor].sum()
+    
+    # Overhang score for non-floor faces
+    DOWN = np.array([0, 0, -1])
+    cos_angles = rotated_normals @ DOWN  # Dot product with DOWN
+    angles = np.arccos(np.clip(cos_angles, -1, 1))
+    phi = angles / np.pi  # Normalize to 0-1
+    penalties = phi ** 3  # Cube to penalize steep overhangs
+    
+    # Weight by sqrt of area, only for non-floor faces
+    overhang_scores = np.sqrt(areas) * penalties
+    overhang_score = overhang_scores[~on_floor].sum()
+    
+    return floor_score + overhang_score
 
 
 # ============================================================================
@@ -265,11 +328,7 @@ def auto_orient_mesh(mesh: trimesh.Trimesh, extended_mode: bool = True) -> trime
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "service": "safire-mesh-server",
-        "tweaker_available": TWEAKER_AVAILABLE
-    }
+    return {"status": "healthy", "service": "safire-mesh-server"}
 
 
 @app.post("/analyze")
@@ -357,7 +416,7 @@ async def orient_mesh(file: UploadFile = File(...)):
         output_path = job_dir / "oriented.stl"
         
         mesh = load_mesh(input_path)
-        oriented = auto_orient_mesh(mesh, extended_mode=True)
+        oriented = auto_orient_mesh(mesh)
         oriented.export(str(output_path))
         
         return FileResponse(
@@ -378,19 +437,16 @@ async def orient_mesh(file: UploadFile = File(...)):
 async def prepare_mesh(
     file: UploadFile = File(...),
     target_size_mm: float = Form(default=0),
-    auto_orient: bool = Form(default=True),
 ):
     """
     Full mesh preparation: repair + auto-orient + center + optional scale.
     
-    Uses Tweaker-3 algorithm (same as Cura's Auto-Orientation) to find
-    the optimal print orientation that minimizes support material.
+    Uses PrusaSlicer's orientation algorithm to find optimal print orientation
+    that maximizes bed contact and minimizes overhangs.
     
     Args:
         file: STL/OBJ file to prepare
         target_size_mm: Scale to this max dimension (0 = no scaling)
-        auto_orient: If True (default), find optimal print orientation.
-                     If False, just lay flat preserving original orientation.
     
     Returns prepared STL file ready for slicing.
     """
@@ -443,12 +499,8 @@ async def prepare_mesh(
                 scale_factor = target_size_mm / current_max
                 mesh.apply_scale(scale_factor)
         
-        # Orient for printing using Tweaker-3 algorithm
-        if auto_orient:
-            mesh = auto_orient_mesh(mesh, extended_mode=True)
-        else:
-            # Just lay flat - move to Z=0 without rotating
-            mesh = lay_flat(mesh)
+        # Auto-orient for optimal printing
+        mesh = auto_orient_mesh(mesh)
         
         # Center on XY origin
         centroid = mesh.centroid
