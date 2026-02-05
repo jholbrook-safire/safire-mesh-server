@@ -8,3 +8,4 @@ python-multipart>=0.0.6
 # Mesh processing
 trimesh>=4.11.0
 numpy>=1.26.0
+scipy>=1.11.0
