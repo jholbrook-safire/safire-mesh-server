@@ -1,0 +1,13 @@
+# Safire Mesh Server Dependencies
+
+# Web framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# Mesh processing
+trimesh==4.0.10
+numpy==1.26.3
+
+# Optional: better STL handling
+numpy-stl==3.1.1
