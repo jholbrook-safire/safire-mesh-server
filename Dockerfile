@@ -1,5 +1,5 @@
 # Safire Mesh Processing Server
-# Uses CuraEngine CLI for slicing and trimesh for mesh operations
+# Uses SuperSlicer CLI for slicing and trimesh for mesh operations
 #
 # Build:  docker build -t safire-mesh-server .
 # Run:    docker run -p 8000:8000 safire-mesh-server
@@ -10,18 +10,33 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies and CuraEngine
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     curl \
+    wget \
+    unzip \
     libgl1-mesa-glx \
     libglu1-mesa \
-    cura-engine \
+    libgtk-3-0 \
+    libglib2.0-0 \
+    libsm6 \
+    libxrender1 \
+    libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
-# Verify CuraEngine installation
-RUN CuraEngine --version || echo "CuraEngine CLI ready"
+# Install SuperSlicer
+WORKDIR /opt
+RUN wget -q https://github.com/supermerill/SuperSlicer/releases/download/2.5.59.13/SuperSlicer_2.5.59.13_linux64_240701.tar.zip -O superslicer.tar.zip \
+    && unzip superslicer.tar.zip \
+    && tar -xf SuperSlicer_2.5.59.13_linux64_240701.tar \
+    && rm superslicer.tar.zip SuperSlicer_2.5.59.13_linux64_240701.tar \
+    && mv SuperSlicer /opt/superslicer \
+    && ln -s /opt/superslicer/superslicer /usr/local/bin/superslicer
+
+# Verify SuperSlicer installation
+RUN superslicer --help | head -5 || echo "SuperSlicer CLI ready"
 
 # Set up Python application
 WORKDIR /app
@@ -34,7 +49,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Environment
-ENV CURA_ENGINE_PATH=/usr/bin/CuraEngine
+ENV SUPERSLICER_PATH=/usr/local/bin/superslicer
 ENV TEMP_DIR=/tmp/safire-mesh
 ENV PORT=8000
 
@@ -48,5 +63,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Run with xvfb for any GUI dependencies
+# Run server
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -2,7 +2,7 @@
 Safire Mesh Processing Server
 
 FastAPI server providing mesh repair, orientation, and slicing.
-Uses trimesh for mesh operations and CuraEngine for slicing.
+Uses trimesh for mesh operations and SuperSlicer CLI for slicing.
 Designed to run as a Docker container on Railway, Render, or similar platforms.
 
 Endpoints:
@@ -42,7 +42,7 @@ from pydantic import BaseModel
 # Configuration
 # ============================================================================
 
-CURA_ENGINE_PATH = os.getenv("CURA_ENGINE_PATH", "CuraEngine")
+SUPERSLICER_PATH = os.getenv("SUPERSLICER_PATH", "superslicer")
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "/tmp/safire-mesh"))
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 
@@ -56,20 +56,20 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: verify CuraEngine is available
+    # Startup: verify SuperSlicer is available
     try:
         result = subprocess.run(
-            [CURA_ENGINE_PATH, "--version"],
+            [SUPERSLICER_PATH, "--help"],
             capture_output=True,
             text=True,
             timeout=10
         )
-        print(f"CuraEngine: {result.stdout.strip() or result.stderr.strip()}")
+        print(f"SuperSlicer available: {SUPERSLICER_PATH}")
     except FileNotFoundError:
-        print("WARNING: CuraEngine not found at", CURA_ENGINE_PATH)
+        print("WARNING: SuperSlicer not found at", SUPERSLICER_PATH)
         print("Slicing endpoint will not be available")
     except Exception as e:
-        print(f"WARNING: Could not check CuraEngine: {e}")
+        print(f"WARNING: Could not check SuperSlicer: {e}")
     
     yield
     
@@ -88,7 +88,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Safire Mesh Server",
-    description="Mesh processing API with trimesh and CuraEngine",
+    description="Mesh processing API with trimesh and SuperSlicer",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -399,10 +399,10 @@ async def slice_mesh(
     infill_percent: int = Form(default=20),
 ):
     """
-    Slice mesh to GCode using CuraEngine.
+    Slice mesh to GCode using SuperSlicer.
     Returns GCode file.
     
-    Note: Requires CuraEngine to be installed.
+    Note: Requires SuperSlicer to be installed.
     """
     job_dir = create_job_dir()
     
@@ -417,17 +417,20 @@ async def slice_mesh(
         prepared_path = job_dir / "prepared.stl"
         mesh.export(str(prepared_path))
         
-        # Run CuraEngine
-        # Note: CuraEngine requires a definition file for settings
-        # This is a simplified example - production would need proper config
+        # Run SuperSlicer CLI
+        # SuperSlicer uses PrusaSlicer-compatible CLI
         cmd = [
-            CURA_ENGINE_PATH,
-            "slice",
-            "-j", "/usr/share/cura/resources/definitions/fdmprinter.def.json",
-            "-o", str(output_path),
-            "-s", f"layer_height={layer_height}",
-            "-s", f"infill_sparse_density={infill_percent}",
-            "-l", str(prepared_path),
+            SUPERSLICER_PATH,
+            "--export-gcode",
+            "--output", str(output_path),
+            "--layer-height", str(layer_height),
+            "--fill-density", f"{infill_percent}%",
+            "--nozzle-diameter", "0.4",
+            "--filament-diameter", "1.75",
+            "--temperature", "200",
+            "--bed-temperature", "60",
+            "--center", "100,100",
+            str(prepared_path),
         ]
         
         try:
@@ -447,7 +450,7 @@ async def slice_mesh(
                 raise HTTPException(500, f"Slicing failed: {error_msg}")
                 
         except FileNotFoundError:
-            raise HTTPException(503, "CuraEngine not available on this server")
+            raise HTTPException(503, "SuperSlicer not available on this server")
         except subprocess.TimeoutExpired:
             raise HTTPException(504, "Slicing timed out")
         
