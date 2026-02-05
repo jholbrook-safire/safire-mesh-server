@@ -284,12 +284,11 @@ async def repair_mesh(file: UploadFile = File(...)):
         # Repair operations
         mesh.fill_holes()
         mesh.fix_normals()
-        mesh.remove_duplicate_faces()
-        mesh.remove_degenerate_faces()
+        mesh.merge_vertices()
         mesh.remove_unreferenced_vertices()
         
-        # Merge close vertices
-        mesh.merge_vertices()
+        # Remove degenerate faces (zero area)
+        mesh.update_faces(mesh.nondegenerate_faces())
         
         mesh.export(str(output_path))
         
@@ -357,9 +356,9 @@ async def prepare_mesh(
         # 1. Repair
         mesh.fill_holes()
         mesh.fix_normals()
-        mesh.remove_duplicate_faces()
-        mesh.remove_degenerate_faces()
         mesh.merge_vertices()
+        mesh.remove_unreferenced_vertices()
+        mesh.update_faces(mesh.nondegenerate_faces())
         
         # 2. Scale if requested
         if target_size_mm > 0:
