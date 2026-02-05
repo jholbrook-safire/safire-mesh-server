@@ -527,11 +527,16 @@ async def prepare_mesh(
 async def slice_mesh(
     file: UploadFile = File(...),
     layer_height: float = Form(default=0.2),
-    infill_percent: int = Form(default=20),
+    infill_percent: int = Form(default=15),
 ):
     """
-    Slice mesh to GCode using SuperSlicer.
-    Returns GCode file.
+    Slice mesh to GCode using SuperSlicer with Bambu P1S profile.
+    Returns GCode file compatible with Bambu Lab P1S printer.
+    
+    Uses the bambu_p1s_ams_slot1.ini profile which includes:
+    - Bambu-specific start G-code (AMS loading, purging, bed leveling)
+    - Bambu-specific end G-code (filament retraction, cooldown)
+    - Optimized print settings for P1S
     
     Note: Requires SuperSlicer to be installed.
     """
@@ -548,21 +553,22 @@ async def slice_mesh(
         prepared_path = job_dir / "prepared.stl"
         mesh.export(str(prepared_path))
         
-        # Run SuperSlicer CLI
-        # SuperSlicer uses PrusaSlicer-compatible CLI
+        # Path to Bambu P1S profile (in same directory as main.py)
+        profile_path = Path(__file__).parent / "bambu_p1s_ams_slot1.ini"
+        
+        # Run SuperSlicer CLI with Bambu profile
+        # --load loads the full profile with Bambu-specific start/end G-code
         cmd = [
             SUPERSLICER_PATH,
+            "--load", str(profile_path),
             "--export-gcode",
             "--output", str(output_path),
             "--layer-height", str(layer_height),
             "--fill-density", f"{infill_percent}%",
-            "--nozzle-diameter", "0.4",
-            "--filament-diameter", "1.75",
-            "--temperature", "200",
-            "--bed-temperature", "60",
-            "--center", "100,100",
             str(prepared_path),
         ]
+        
+        print(f"Running SuperSlicer with Bambu profile: {' '.join(cmd)}")
         
         try:
             loop = asyncio.get_event_loop()
@@ -575,6 +581,9 @@ async def slice_mesh(
                     timeout=300
                 )
             )
+            
+            print(f"SuperSlicer stdout: {result.stdout[:500] if result.stdout else 'none'}")
+            print(f"SuperSlicer stderr: {result.stderr[:500] if result.stderr else 'none'}")
             
             if not output_path.exists():
                 error_msg = result.stderr or result.stdout or "Unknown error"
